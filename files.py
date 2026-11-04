@@ -128,6 +128,7 @@ def create_embedding(df):
     for idx, row in df.iterrows():
         # Construct a descriptive text representation for embedding:
         # Combining the source, themes, and identifier gives the vector model rich context.
+        # ONLY SAVES PARAMETERS, RATHER THAN FULL TEXT
         doc_text = f"Article from {row['SourceCommonName']}. Themes: {row['V2Themes']}. Link: {row['DocumentIdentifier']}"
 
         avg_tone = float(str(row["Tone"]).split(",")[0])
@@ -141,7 +142,6 @@ def create_embedding(df):
         })
         ids.append(f"doc_{idx}")
 
-    print(f"Adding {len(documents)} articles to Chroma vector store...")
     collection.add(documents=documents, metadatas=metadatas, ids=ids)
 
     print(

@@ -1,0 +1,1 @@
+this project will use chroma to find embeddings for articles, and then we will continue to build a classifyer :)
