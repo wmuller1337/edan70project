@@ -5,6 +5,36 @@ import glob
 import pandas as pd
 import chromadb
 from chromadb.utils import embedding_functions
+from newspaper import Article
+
+def scrape_article_text(url):
+    try:
+        # scrape the article text using newspaper3k
+        article = Article(url, request_timeout=5)
+        article.download()
+        article.parse()
+        
+        # article.text contains ONLY the main body of the article
+        return article.text
+    except Exception as e:
+        # If scraping fails return an empty string
+        return ""
+
+def add_full_text_to_df(df, limit=20):
+    print(f"Scraping full text for the first {limit} articles...")
+    
+    # Working on a copy of the sample
+    sample_df = df.head(limit).copy()
+    
+    # Getting the main text for each URL
+    sample_df["FullText"] = sample_df["DocumentIdentifier"].apply(scrape_article_text)
+    
+    # Filter out articles where scraping failed (empty text)
+    successful = sample_df[sample_df["FullText"].str.len() > 0]
+    print(f"Successfully scraped {len(successful)} out of {limit} articles.")
+    
+    return sample_df
+    
 
 
 def read_df():
@@ -107,6 +137,12 @@ def create_embedding(df):
     # setting up embeddings for articles
             
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    # delete the existing collection if it exists, to start fresh
+    try:
+        chroma_client.delete_collection("climate_denial_discourse")
+        print("Rensade den gamla databasen.")
+    except Exception:
+        pass  # If the collection doesn't exist, ignore the error
 
     # setup embedding function
     sentence_transformer_ef = (
@@ -116,7 +152,7 @@ def create_embedding(df):
     )
 
     collection = chroma_client.get_or_create_collection(
-        name="climate_refugees",
+        name="climate_denial_discourse",
         embedding_function=sentence_transformer_ef,
         metadata={"hnsw:space": "cosine"},  # cosine similarity
     )
@@ -126,10 +162,16 @@ def create_embedding(df):
     ids = []
 
     for idx, row in df.iterrows():
-        # Construct a descriptive text representation for embedding:
-        # Combining the source, themes, and identifier gives the vector model rich context.
-        # ONLY SAVES PARAMETERS, RATHER THAN FULL TEXT
-        doc_text = f"Article from {row['SourceCommonName']}. Themes: {row['V2Themes']}. Link: {row['DocumentIdentifier']}"
+        # Check if scraped full text exists and is not empty
+        full_text = str(row.get("FullText", "")).strip()
+        
+        if full_text:
+            # Including the source and the first 1500 chars of full text
+            # all-MiniLM-L6-v2 will automatically truncate at 256 tokens anyways
+            # first 1500 characters is reasonable for context
+            doc_text = f"Source: {row['SourceCommonName']}. Text: {full_text[:1500]}"
+        else:
+            continue  # Skip this record if no full text is available (change if we want to include records without full text)
 
         avg_tone = float(str(row["Tone"]).split(",")[0])
 
@@ -138,17 +180,20 @@ def create_embedding(df):
             "source": str(row["SourceCommonName"]),
             "date": int(row["DATE"]),
             "url": str(row["DocumentIdentifier"]),
-            "tone": avg_tone,
+            "tone": avg_tone
         })
         ids.append(f"doc_{idx}")
 
-    collection.add(documents=documents, metadatas=metadatas, ids=ids)
+    if documents:
+        collection.add(documents=documents, metadatas=metadatas, ids=ids)
+        print(f"Stored {len(documents)} articles with full text. Total in database: {collection.count()}")
+    else:
+        print("No articles with full text found to save.")
 
-    print(
-        f"Successfully stored! Total records in Chroma: {collection.count()}"
-    )
-
-
+# retrieve the dataframe, filter for climate articles
 df = read_df()
 climate_df = cretate_climate_df(df)
-create_embedding(climate_df)
+# Scrape full text andadd it to the dataframe (limit=20 for testing purposes)
+climate_df_scraped = add_full_text_to_df(climate_df, limit=20)
+# Create embeddings for the scraped articles and store them in the ChromaDB collection
+create_embedding(climate_df_scraped)
