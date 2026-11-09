@@ -14,10 +14,11 @@ from sklearn.model_selection import cross_val_score, train_test_split
 def read_df():
 
     #  download for a single 15-minute chunk
-    url = "http://data.gdeltproject.org/gdeltv2/20240501120000.gkg.csv.zip"
-    response = urllib.request.urlopen(url)
-    zip_file = zipfile.ZipFile(io.BytesIO(response.read()))
-    zip_file.extractall("./gkg_raw_data")
+    urls = [
+            f"http://data.gdeltproject.org/gdeltv2/20240501{hour:02d}{minute:02d}00.gkg.csv.zip"
+            for hour in range(0, 24, 2)  # Every 2 hours across the day
+            for minute in (0, 30)  # At 00 and 30 minutes
+        ]
 
     # Define the primary column names according to the GDELT GKG v2 schema
     COLUMN_NAMES = [
@@ -49,17 +50,36 @@ def read_df():
         "TranslationInfo",
         "ExtrasXML",
     ]
-
+    
+    
+    for idx, url in enumerate(urls, 1):
+        try:
+            response = urllib.request.urlopen(url)
+            with zipfile.ZipFile(io.BytesIO(response.read())) as zip_file:
+                zip_file.extractall("./gkg_raw_data")
+        except Exception as e:
+            print(f"[{idx}/{len(urls)}] Failed to fetch {url}: {e}")
+            
+    
     files = glob.glob("./gkg_raw_data/*.gkg.csv")
-    file_path = files[0]
 
-    df = pd.read_csv(
+    df = []
+    
+    for file_path in files:
+        df_single = pd.read_csv(
             file_path,
             sep="\t",
             names=COLUMN_NAMES,
             header=None,
-            on_bad_lines="skip",  # skips occasional malformed lines
+            on_bad_lines="skip",
             low_memory=False,
+            )
+        df.append(df_single)
+    
+    df = pd.concat(df, ignore_index=True)
+    
+    print(
+        f"Successfully loaded total dataset of {len(df)} raw records."
     )
     
     return df
