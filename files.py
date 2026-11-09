@@ -2,9 +2,13 @@ import urllib.request
 import zipfile
 import io
 import glob
+import numpy as np
 import pandas as pd
 import chromadb
 from chromadb.utils import embedding_functions
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import cross_val_score, train_test_split
 
 
 def read_df():
@@ -99,8 +103,7 @@ def cretate_climate_df(df):
             print(f"Tone:       {row['Tone']}")
             print(f"Themes:     {str(row['V2Themes'])[:150]}...")  # Truncated for readability
             
-    return climate_df
-            
+    return climate_df     
             
             
 def create_embedding(df):     
@@ -147,8 +150,93 @@ def create_embedding(df):
     print(
         f"Successfully stored! Total records in Chroma: {collection.count()}"
     )
+    
+    return collection
+
+
+def classification(X: np.ndarray,
+    y: np.ndarray,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    C: float = 1.0,
+    target_names: list = None,):
+    
+    X = np.array(X)
+    y = np.array(y)
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+    
+    model = LogisticRegression(
+        max_iter=1000,
+        C=C,
+        class_weight="balanced",
+        random_state=random_state,
+        solver="lbfgs",
+    )
+    model.fit(X_train, y_train)
+    
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)
+    
+    cv_scores = cross_val_score(model, X, y, cv=5, scoring="accuracy")
+    
+    print("==================================================")
+    print("         LOGISTIC REGRESSION EVALUATION          ")
+    print("==================================================")
+    print(
+        f"5-Fold Cross-Validation Accuracy: {cv_scores.mean():.4f} (± {cv_scores.std():.4f})\n"
+    )
+
+    names = (
+        target_names
+        if target_names
+        else [str(c) for c in np.unique(y)]
+    )
+    print(classification_report(y_test, y_pred, target_names=names))
+
+    cm = confusion_matrix(y_test, y_pred)
+    print("Confusion Matrix:")
+    print(cm)
+    print("==================================================")
+
+    results = {
+        "X_train": X_train,
+        "X_test": X_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "y_pred": y_pred,
+        "y_proba": y_proba,
+        "cv_scores": cv_scores,
+        "confusion_matrix": cm,
+    }
+
+    return model, results
+
 
 
 df = read_df()
 climate_df = cretate_climate_df(df)
-create_embedding(climate_df)
+embs = create_embedding(climate_df)
+
+
+data = embs.get(include=["embeddings", "metadatas"])
+
+# x is embeddings of the text
+X_embeddings = np.array(data["embeddings"])
+
+# so y is the tone
+metadatas = data["metadatas"]
+y_labels = np.array(
+    [1 if meta["tone"] < -2.0 else 0 for meta in metadatas]
+)
+
+trained_model, eval_results = classification(
+    X=X_embeddings,
+    y=y_labels,
+    target_names=["Neutral/Positive", "Negative Framing"],
+)
+
+
+
