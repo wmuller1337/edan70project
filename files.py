@@ -190,7 +190,7 @@ def create_embedding(df):
     # setup embedding function
     sentence_transformer_ef = (
         embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
+            model_name="microsoft/harrier-oss-v1-270m"
         )
     )
 
