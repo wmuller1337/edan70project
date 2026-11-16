@@ -140,7 +140,7 @@ def create_embedding(df):
     # delete the existing collection if it exists, to start fresh
     try:
         chroma_client.delete_collection("climate_denial_discourse")
-        print("Rensade den gamla databasen.")
+        print("Clearing existing database.")
     except Exception:
         pass  # If the collection doesn't exist, ignore the error
 
