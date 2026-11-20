@@ -2,6 +2,8 @@ import urllib.request
 import zipfile
 import io
 import glob
+import os
+import re
 import numpy as np
 import pandas as pd
 import chromadb
@@ -23,19 +25,23 @@ HEADERS = {
 
 
 def scrape_article_text(url):
+    """Extract the main body text of an article.
+
+    Tries newspaper3k first; if that fails or returns too little text,
+    falls back to trafilatura. Returns an empty string if both fail.
+    """
+    # Method 1: newspaper3k
     try:
-        # scrape the article text using newspaper3k
         article = Article(url, request_timeout=5)
         article.download()
         article.parse()
-        
         # article.text contains ONLY the main body of the article
-        return article.text
-    except Exception as e:
-        # If scraping fails return an empty string
-        return ""
+        if article.text and len(article.text.strip()) > 50:
+            return article.text.strip()
+    except Exception:
+        pass
 
-    # Method 2: Fallback to Trafilatura
+    # Method 2: fallback to trafilatura (now actually reachable)
     try:
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
@@ -50,31 +56,61 @@ def scrape_article_text(url):
     except Exception:
         pass
 
-    return None
+    # If both methods fail, return an empty string
+    return ""
 
 def add_full_text_to_df(df, limit=20):
-    print(f"Scraping full text for the first {limit} articles...")
-    
+    print(f"Scraping full text for up to {limit} articles...")
+
+    # Deduplicate on the article URL so we don't scrape/embed the same
+    # article multiple times (and don't waste the limit on duplicates).
+    deduped = df.drop_duplicates(subset="DocumentIdentifier")
+
     # Working on a copy of the sample
-    sample_df = df.head(limit).copy()
-    
+    sample_df = deduped.head(limit).copy()
+
     # Getting the main text for each URL
     sample_df["FullText"] = sample_df["DocumentIdentifier"].apply(scrape_article_text)
-    
-    # Filter out articles where scraping failed (empty text)
-    successful = sample_df[sample_df["FullText"].str.len() > 0]
-    print(f"Successfully scraped {len(successful)} out of {limit} articles.")
-    
-    return sample_df
+
+    # Keep only articles where scraping actually produced text
+    successful = sample_df[sample_df["FullText"].str.len() > 0].reset_index(drop=True)
+    print(f"Successfully scraped {len(successful)} out of {len(sample_df)} articles.")
+
+    # Return the filtered successful frame so empty scrapes don't flow downstream
+    return successful
+
+def parse_source_language(translation_info):
+    """Return the source-language code for a GKG record.
+
+    GDELT's translingual stream stores the original language in the
+    TranslationInfo field as "srclc:<lang>;eng:<engine>;...". English-origin
+    records (from the English stream) have an empty field, which we map to
+    "eng".
+    """
+    text = str(translation_info) if translation_info is not None else ""
+    match = re.search(r"srclc:(\w+)", text)
+    return match.group(1) if match else "eng"
+
 
 def read_df():
 
-    #  download for a single 15-minute chunk
-    urls = [
-            f"http://data.gdeltproject.org/gdeltv2/20240501{hour:02d}{minute:02d}00.gkg.csv.zip"
-            for hour in range(0, 24, 2)  # Every 2 hours across the day
-            for minute in (0, 30)  # At 00 and 30 minutes
-        ]
+    # Build timestamps for every 2 hours across the day, at :00 and :30
+    timestamps = [
+        f"20240501{hour:02d}{minute:02d}00"
+        for hour in range(0, 24, 2)
+        for minute in (0, 30)
+    ]
+
+    # Download BOTH GKG streams per timestamp:
+    #   <ts>.gkg.csv.zip              -> English-only stream
+    #   <ts>.translation.gkg.csv.zip  -> translingual stream (65+ languages,
+    #                                    machine-translated), which is what
+    #                                    makes the corpus actually multilingual.
+    base = "http://data.gdeltproject.org/gdeltv2"
+    urls = []
+    for ts in timestamps:
+        urls.append(f"{base}/{ts}.gkg.csv.zip")
+        urls.append(f"{base}/{ts}.translation.gkg.csv.zip")
 
     # Define the primary column names according to the GDELT GKG v2 schema
     COLUMN_NAMES = [
@@ -108,7 +144,14 @@ def read_df():
     ]
     
     
+    os.makedirs("./gkg_raw_data", exist_ok=True)
+
     for idx, url in enumerate(urls, 1):
+        # The extracted CSV has the same name as the zip minus ".zip".
+        expected = os.path.join("./gkg_raw_data", os.path.basename(url)[:-4])
+        if os.path.exists(expected):
+            # Already downloaded on a previous run; skip to save time/bandwidth.
+            continue
         try:
             response = urllib.request.urlopen(url)
             with zipfile.ZipFile(io.BytesIO(response.read())) as zip_file:
@@ -133,11 +176,19 @@ def read_df():
         df.append(df_single)
     
     df = pd.concat(df, ignore_index=True)
-    
+
+    # Derive a source-language field from the TranslationInfo column.
+    # English-origin records have an empty TranslationInfo; translingual
+    # records carry "srclc:<lang>;..." indicating the original language.
+    df["Language"] = df["TranslationInfo"].apply(parse_source_language)
+
     print(
         f"Successfully loaded total dataset of {len(df)} raw records."
     )
-    
+    lang_counts = df["Language"].value_counts()
+    print("Language distribution (top 10):")
+    print(lang_counts.head(10).to_string())
+
     return df
 
 
@@ -295,31 +346,32 @@ def classification(X: np.ndarray,
 
 
 
-print("read df")
-df = read_df()
-print("filter on climate df")
-climate_df = cretate_climate_df(df)
-print("scrape for full articles")
-climate_df_scraped = add_full_text_to_df(climate_df, limit=100)
+if __name__ == "__main__":
+    print("read df")
+    df = read_df()
+    print("filter on climate df")
+    climate_df = cretate_climate_df(df)
+    print("scrape for full articles")
+    climate_df_scraped = add_full_text_to_df(climate_df, limit=100)
 
-embs = create_embedding(climate_df_scraped)
+    embs = create_embedding(climate_df_scraped)
 
-data = embs.get(include=["embeddings", "metadatas"])
+    data = embs.get(include=["embeddings", "metadatas"])
 
-# x is embeddings of the text
-X_embeddings = np.array(data["embeddings"])
+    # x is embeddings of the text
+    X_embeddings = np.array(data["embeddings"])
 
-# so y is the tone
-metadatas = data["metadatas"]
-y_labels = np.array(
-    [1 if meta["tone"] < -2.0 else 0 for meta in metadatas]
-)
+    # so y is the tone
+    metadatas = data["metadatas"]
+    y_labels = np.array(
+        [1 if meta["tone"] < -2.0 else 0 for meta in metadatas]
+    )
 
-trained_model, eval_results = classification(
-    X=X_embeddings,
-    y=y_labels,
-    target_names=["Neutral/Positive", "Negative Framing"],
-)
+    trained_model, eval_results = classification(
+        X=X_embeddings,
+        y=y_labels,
+        target_names=["Neutral/Positive", "Negative Framing"],
+    )
 
 
 
