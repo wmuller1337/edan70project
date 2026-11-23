@@ -87,8 +87,15 @@ def gdelt_to_nllb(srclc: str) -> str:
 # Lazy model loaders (cached) - kept out of import time so tests stay cheap
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
+def _device():
+    """Return 'cuda' if a GPU is available, else 'cpu' (cached)."""
+    import torch
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+@lru_cache(maxsize=1)
 def _load_cards():
-    """Load and cache the CARDS tokenizer + model."""
+    """Load and cache the CARDS tokenizer + model (on GPU if available)."""
     import torch  # noqa: F401  (ensures torch is available / sets backend)
     from transformers import (
         AutoTokenizer,
@@ -97,13 +104,14 @@ def _load_cards():
 
     tokenizer = AutoTokenizer.from_pretrained(CARDS_MODEL)
     model = AutoModelForSequenceClassification.from_pretrained(CARDS_MODEL)
+    model.to(_device())
     model.eval()
     return tokenizer, model
 
 
 @lru_cache(maxsize=1)
 def _load_nllb():
-    """Load and cache the NLLB tokenizer + model."""
+    """Load and cache the NLLB tokenizer + model (on GPU if available)."""
     import torch  # noqa: F401
     from transformers import (
         AutoTokenizer,
@@ -112,6 +120,7 @@ def _load_nllb():
 
     tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL)
     model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL)
+    model.to(_device())
     model.eval()
     return tokenizer, model
 
@@ -156,7 +165,7 @@ def translate(
             padding=True,
             truncation=True,
             max_length=512,
-        )
+        ).to(_device())
         with torch.no_grad():
             generated = model.generate(
                 **encoded,
@@ -164,7 +173,7 @@ def translate(
                 max_length=512,
             )
         outputs.extend(
-            tokenizer.batch_decode(generated, skip_special_tokens=True)
+            tokenizer.batch_decode(generated.cpu(), skip_special_tokens=True)
         )
     return outputs
 
@@ -212,11 +221,11 @@ def classify_denial(
             padding=True,
             truncation=True,
             max_length=512,
-        )
+        ).to(_device())
         with torch.no_grad():
             logits = model(**encoded).logits
             probs = torch.softmax(logits, dim=-1)
-        denial_probs = probs[:, LABEL_DENIAL]
+        denial_probs = probs[:, LABEL_DENIAL].cpu()
         batch_labels = (denial_probs >= 0.5).long().tolist()
         labels.extend(batch_labels)
         scores.extend(denial_probs.tolist())

@@ -9,3 +9,6 @@ venv/
 
 # CARDS dataset cache (downloaded on demand; not redistributed)
 cards_data/
+
+# Pipeline caches (scraped/labelled intermediates)
+cache/

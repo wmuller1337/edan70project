@@ -4,6 +4,7 @@ import io
 import glob
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import chromadb
@@ -67,8 +68,9 @@ def scrape_article_text(url):
     # If both methods fail, return an empty string
     return ""
 
-def add_full_text_to_df(df, limit=20):
-    print(f"Scraping full text for up to {limit} articles...")
+def add_full_text_to_df(df, limit=20, max_workers=12):
+    print(f"Scraping full text for up to {limit} articles "
+          f"({max_workers} parallel workers)...")
 
     # Deduplicate on the article URL so we don't scrape/embed the same
     # article multiple times (and don't waste the limit on duplicates).
@@ -77,8 +79,12 @@ def add_full_text_to_df(df, limit=20):
     # Working on a copy of the sample
     sample_df = deduped.head(limit).copy()
 
-    # Getting the main text for each URL
-    sample_df["FullText"] = sample_df["DocumentIdentifier"].apply(scrape_article_text)
+    # Scrape concurrently - scraping is network-bound, so a thread pool gives
+    # a large wall-clock speedup. executor.map preserves input order.
+    urls = sample_df["DocumentIdentifier"].tolist()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        texts = list(executor.map(scrape_article_text, urls))
+    sample_df["FullText"] = texts
 
     # Keep only articles where scraping actually produced text
     successful = sample_df[sample_df["FullText"].str.len() > 0].reset_index(drop=True)
@@ -250,10 +256,18 @@ def create_embedding(df, rebuild=True):
 
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
+    # Use GPU for embedding if available (falls back to CPU cleanly)
+    try:
+        import torch
+        embed_device = "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        embed_device = "cpu"
+
     # setup embedding function
     sentence_transformer_ef = (
         embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="microsoft/harrier-oss-v1-270m"
+            model_name="microsoft/harrier-oss-v1-270m",
+            device=embed_device,
         )
     )
 
@@ -389,38 +403,62 @@ if __name__ == "__main__":
     REBUILD_EMBEDDINGS = True   # False -> reuse existing Chroma collection
     CARDS_MAX_ENGLISH = 500     # cap on English CARDS denial examples
     CARDS_PER_LANGUAGE = 100    # translated denial examples per target language
+    USE_CACHE = True            # cache scraped + labelled data to skip recompute
+    SCRAPE_WORKERS = 12         # parallel scraping threads
+    CACHE_DIR = "./cache"
+    SCRAPED_CACHE = os.path.join(CACHE_DIR, "scraped.pkl")
+    LABELLED_CACHE = os.path.join(CACHE_DIR, "labelled.pkl")
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
-    print("read df")
-    df = read_df()
-    print("filter on climate df")
-    climate_df = cretate_climate_df(df)
-    print("scrape for full articles")
-    climate_df_scraped = add_full_text_to_df(climate_df, limit=100)
+    # ---- data -> scrape -> label -> backfill, with staged caching ----
+    if USE_CACHE and os.path.exists(LABELLED_CACHE):
+        print(f"[cache] loading labelled data from {LABELLED_CACHE}")
+        climate_df_labelled = pd.read_pickle(LABELLED_CACHE)
+    else:
+        if USE_CACHE and os.path.exists(SCRAPED_CACHE):
+            print(f"[cache] loading scraped data from {SCRAPED_CACHE}")
+            climate_df_scraped = pd.read_pickle(SCRAPED_CACHE)
+        else:
+            print("read df")
+            df = read_df()
+            print("filter on climate df")
+            climate_df = cretate_climate_df(df)
+            print("scrape for full articles")
+            climate_df_scraped = add_full_text_to_df(
+                climate_df, limit=100, max_workers=SCRAPE_WORKERS
+            )
+            if USE_CACHE:
+                climate_df_scraped.to_pickle(SCRAPED_CACHE)
+                print(f"[cache] saved scraped data -> {SCRAPED_CACHE}")
 
-    # Stage 2: binary denial labels via CARDS (+ NLLB translation for
-    # non-English). Drop rows we could not label (unmapped language).
-    print("label denial (CARDS + translation)")
-    climate_df_labelled = add_denial_labels(climate_df_scraped)
-    climate_df_labelled = climate_df_labelled.dropna(
-        subset=["DenialLabel"]
-    ).reset_index(drop=True)
-    climate_df_labelled["DenialLabel"] = climate_df_labelled[
-        "DenialLabel"
-    ].astype(int)
+        # Stage 2: binary denial labels via CARDS (+ NLLB translation for
+        # non-English). Drop rows we could not label (unmapped language).
+        print("label denial (CARDS + translation)")
+        climate_df_labelled = add_denial_labels(climate_df_scraped)
+        climate_df_labelled = climate_df_labelled.dropna(
+            subset=["DenialLabel"]
+        ).reset_index(drop=True)
+        climate_df_labelled["DenialLabel"] = climate_df_labelled[
+            "DenialLabel"
+        ].astype(int)
 
-    # Stage 3 backfill: strengthen the (minority) denial class with CARDS
-    # examples, translated into the languages present in our GDELT data.
-    if USE_CARDS_BACKFILL:
-        print("backfill denial class from CARDS")
-        target_langs = sorted(set(climate_df_labelled["Language"]))
-        cards_df = backfill_denial(
-            target_languages=target_langs,
-            max_english=CARDS_MAX_ENGLISH,
-            per_language=CARDS_PER_LANGUAGE,
-        )
-        climate_df_labelled = pd.concat(
-            [climate_df_labelled, cards_df], ignore_index=True
-        )
+        # Stage 3 backfill: strengthen the (minority) denial class with CARDS
+        # examples, translated into the languages present in our GDELT data.
+        if USE_CARDS_BACKFILL:
+            print("backfill denial class from CARDS")
+            target_langs = sorted(set(climate_df_labelled["Language"]))
+            cards_df = backfill_denial(
+                target_languages=target_langs,
+                max_english=CARDS_MAX_ENGLISH,
+                per_language=CARDS_PER_LANGUAGE,
+            )
+            climate_df_labelled = pd.concat(
+                [climate_df_labelled, cards_df], ignore_index=True
+            )
+
+        if USE_CACHE:
+            climate_df_labelled.to_pickle(LABELLED_CACHE)
+            print(f"[cache] saved labelled data -> {LABELLED_CACHE}")
 
     embs = create_embedding(climate_df_labelled, rebuild=REBUILD_EMBEDDINGS)
 
