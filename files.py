@@ -16,6 +16,11 @@ import requests
 import trafilatura
 
 from labelling import add_denial_labels
+from evaluation import (
+    print_language_label_crosstab,
+    evaluate,
+    auto_cross_lingual,
+)
 
 HEADERS = {
     "User-Agent": (
@@ -381,12 +386,21 @@ if __name__ == "__main__":
     # y is now the REAL denial label (0/1) from Stage 2, not the tone proxy
     metadatas = data["metadatas"]
     y_labels = np.array([int(meta["label"]) for meta in metadatas])
+    languages = [str(meta["language"]) for meta in metadatas]
 
-    trained_model, eval_results = classification(
-        X=X_embeddings,
-        y=y_labels,
+    # Stage 3: inspect the language x label distribution (flag sparse cells)
+    print_language_label_crosstab(languages, y_labels)
+
+    # Stage 6: overall + per-language macro-F1 evaluation
+    trained_model = evaluate(
+        X_embeddings,
+        y_labels,
+        languages,
         target_names=["Not Denial", "Denial"],
     )
+
+    # Stage 6: cross-lingual transfer (train on some languages, test held-out one)
+    auto_cross_lingual(X_embeddings, y_labels, languages)
 
 
 
