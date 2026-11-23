@@ -15,6 +15,8 @@ from newspaper import Article, ArticleException
 import requests
 import trafilatura
 
+from labelling import add_denial_labels
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -273,6 +275,10 @@ def create_embedding(df):
             "date": int(row["DATE"]),
             "url": str(row["DocumentIdentifier"]),
             "tone": avg_tone,
+            "language": str(row["Language"]),
+            # Real denial label from Stage 2 (CARDS + translation)
+            "label": int(row["DenialLabel"]),
+            "denial_score": float(row["DenialScore"]),
         })
         ids.append(f"doc_{idx}")
 
@@ -354,23 +360,32 @@ if __name__ == "__main__":
     print("scrape for full articles")
     climate_df_scraped = add_full_text_to_df(climate_df, limit=100)
 
-    embs = create_embedding(climate_df_scraped)
+    # Stage 2: binary denial labels via CARDS (+ NLLB translation for
+    # non-English). Drop rows we could not label (unmapped language).
+    print("label denial (CARDS + translation)")
+    climate_df_labelled = add_denial_labels(climate_df_scraped)
+    climate_df_labelled = climate_df_labelled.dropna(
+        subset=["DenialLabel"]
+    ).reset_index(drop=True)
+    climate_df_labelled["DenialLabel"] = climate_df_labelled[
+        "DenialLabel"
+    ].astype(int)
+
+    embs = create_embedding(climate_df_labelled)
 
     data = embs.get(include=["embeddings", "metadatas"])
 
-    # x is embeddings of the text
+    # X is the multilingual embeddings of the original-language text
     X_embeddings = np.array(data["embeddings"])
 
-    # so y is the tone
+    # y is now the REAL denial label (0/1) from Stage 2, not the tone proxy
     metadatas = data["metadatas"]
-    y_labels = np.array(
-        [1 if meta["tone"] < -2.0 else 0 for meta in metadatas]
-    )
+    y_labels = np.array([int(meta["label"]) for meta in metadatas])
 
     trained_model, eval_results = classification(
         X=X_embeddings,
         y=y_labels,
-        target_names=["Neutral/Positive", "Negative Framing"],
+        target_names=["Not Denial", "Denial"],
     )
 
 

@@ -1,0 +1,22 @@
+# Core data pipeline
+pandas
+numpy
+requests
+
+# Scraping (Stage 1)
+trafilatura
+newspaper3k
+lxml_html_clean          # required by newspaper3k on Python >=3.9
+
+# Embeddings + vector store (Stage 4)
+chromadb
+sentence-transformers
+# harrier-oss is a Gemma3 model -> needs a recent transformers
+transformers>=4.57.0
+torch
+
+# Stage 2 labelling: NLLB translation needs sentencepiece
+sentencepiece
+
+# Classifier (Stage 5)
+scikit-learn
