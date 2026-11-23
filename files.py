@@ -16,6 +16,7 @@ import requests
 import trafilatura
 
 from labelling import add_denial_labels
+from cards_backfill import backfill_denial
 from evaluation import (
     print_language_label_crosstab,
     evaluate,
@@ -240,9 +241,13 @@ def cretate_climate_df(df):
     return climate_df     
             
             
-def create_embedding(df):     
+def create_embedding(df, rebuild=True):
     # setting up embeddings for articles
-            
+    #
+    # rebuild=True  -> delete any existing collection and embed from scratch.
+    # rebuild=False -> if a non-empty collection already exists, reuse it
+    #                  (skips re-embedding, which is the slow/expensive step).
+
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
     # setup embedding function
@@ -253,12 +258,33 @@ def create_embedding(df):
     )
 
     collection_name = "climate_fulltext"
+
+    # Reuse path: if not rebuilding and a populated collection exists, return it.
+    if not rebuild:
+        existing = {c.name for c in chroma_client.list_collections()}
+        if collection_name in existing:
+            collection = chroma_client.get_collection(
+                name=collection_name,
+                embedding_function=sentence_transformer_ef,
+            )
+            if collection.count() > 0:
+                print(
+                    f"Reusing existing embedding collection "
+                    f"'{collection_name}' with {collection.count()} records "
+                    f"(rebuild=False). Pass rebuild=True to re-embed."
+                )
+                return collection
+            print(
+                f"Collection '{collection_name}' exists but is empty; "
+                f"rebuilding."
+            )
+
+    # Rebuild path: drop any existing collection and re-create it.
     try:
         chroma_client.delete_collection(name=collection_name)
     except Exception:
         pass
 
-    
     collection = chroma_client.create_collection(
         name=collection_name,
         embedding_function=sentence_transformer_ef,
@@ -358,6 +384,12 @@ def classification(X: np.ndarray,
 
 
 if __name__ == "__main__":
+    # ----- pipeline configuration -----
+    USE_CARDS_BACKFILL = True   # add CARDS denial examples to the denial class
+    REBUILD_EMBEDDINGS = True   # False -> reuse existing Chroma collection
+    CARDS_MAX_ENGLISH = 500     # cap on English CARDS denial examples
+    CARDS_PER_LANGUAGE = 100    # translated denial examples per target language
+
     print("read df")
     df = read_df()
     print("filter on climate df")
@@ -376,7 +408,21 @@ if __name__ == "__main__":
         "DenialLabel"
     ].astype(int)
 
-    embs = create_embedding(climate_df_labelled)
+    # Stage 3 backfill: strengthen the (minority) denial class with CARDS
+    # examples, translated into the languages present in our GDELT data.
+    if USE_CARDS_BACKFILL:
+        print("backfill denial class from CARDS")
+        target_langs = sorted(set(climate_df_labelled["Language"]))
+        cards_df = backfill_denial(
+            target_languages=target_langs,
+            max_english=CARDS_MAX_ENGLISH,
+            per_language=CARDS_PER_LANGUAGE,
+        )
+        climate_df_labelled = pd.concat(
+            [climate_df_labelled, cards_df], ignore_index=True
+        )
+
+    embs = create_embedding(climate_df_labelled, rebuild=REBUILD_EMBEDDINGS)
 
     data = embs.get(include=["embeddings", "metadatas"])
 

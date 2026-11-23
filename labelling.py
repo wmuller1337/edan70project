@@ -119,30 +119,33 @@ def _load_nllb():
 # ---------------------------------------------------------------------------
 # Translation
 # ---------------------------------------------------------------------------
-def translate_to_english(
+def translate(
     texts: List[str],
     src_nllb_code: str,
+    tgt_nllb_code: str = TARGET_LANG,
     max_input_chars: int = 1500,
     batch_size: int = 8,
 ) -> List[str]:
-    """Translate a list of same-language texts into English using NLLB.
+    """Translate texts from one language to another using NLLB.
 
     Args:
         texts: source-language strings (all in the SAME source language).
-        src_nllb_code: the NLLB FLORES-200 code of the source language.
+        src_nllb_code: NLLB FLORES-200 code of the source language.
+        tgt_nllb_code: NLLB FLORES-200 code of the target language
+            (defaults to English).
         max_input_chars: truncate each input to this many characters before
-            translating (CARDS only reads ~512 tokens downstream, so we don't
-            need the full article and this keeps translation fast).
+            translating (keeps translation fast; downstream CARDS only reads
+            ~512 tokens anyway).
         batch_size: number of texts per model forward pass.
 
     Returns:
-        List of English translations, aligned with ``texts``.
+        List of translations, aligned with ``texts``.
     """
     import torch
 
     tokenizer, model = _load_nllb()
     tokenizer.src_lang = src_nllb_code
-    bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
+    bos_token_id = tokenizer.convert_tokens_to_ids(tgt_nllb_code)
 
     outputs: List[str] = []
     for start in range(0, len(texts), batch_size):
@@ -164,6 +167,22 @@ def translate_to_english(
             tokenizer.batch_decode(generated, skip_special_tokens=True)
         )
     return outputs
+
+
+def translate_to_english(
+    texts: List[str],
+    src_nllb_code: str,
+    max_input_chars: int = 1500,
+    batch_size: int = 8,
+) -> List[str]:
+    """Translate same-language texts into English (thin wrapper over translate)."""
+    return translate(
+        texts,
+        src_nllb_code,
+        TARGET_LANG,
+        max_input_chars=max_input_chars,
+        batch_size=batch_size,
+    )
 
 
 # ---------------------------------------------------------------------------

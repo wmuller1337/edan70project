@@ -18,5 +18,8 @@ torch
 # Stage 2 labelling: NLLB translation needs sentencepiece
 sentencepiece
 
+# Stage 3 backfill: download CARDS data from Google Drive
+gdown
+
 # Classifier (Stage 5)
 scikit-learn

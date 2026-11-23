@@ -6,3 +6,6 @@ venv/
 
 # Local experiment artifacts
 *.log
+
+# CARDS dataset cache (downloaded on demand; not redistributed)
+cards_data/
