@@ -17,7 +17,7 @@ import requests
 import trafilatura
 
 from labelling import add_denial_labels
-from cards_backfill import backfill_denial
+from cards_backfill import build_cards_dataset
 from evaluation import (
     print_language_label_crosstab,
     evaluate,
@@ -399,80 +399,49 @@ def classification(X: np.ndarray,
 
 if __name__ == "__main__":
     # ----- pipeline configuration -----
-    USE_CARDS_BACKFILL = True   # add CARDS denial examples to the denial class
     REBUILD_EMBEDDINGS = True   # False -> reuse existing Chroma collection
-    CARDS_MAX_ENGLISH = 500     # cap on English CARDS denial examples
-    CARDS_PER_LANGUAGE = 100    # translated denial examples per target language
-    USE_CACHE = True            # cache scraped + labelled data to skip recompute
-    SCRAPE_WORKERS = 12         # parallel scraping threads
+    USE_CACHE = True            # cache the built dataset to skip recompute
+    # Languages to build multilingual coverage for (translated from English
+    # via NLLB). 'eng' is always included natively.
+    TARGET_LANGUAGES = ["spa", "deu", "fra", "por", "rus", "zho"]
+    CARDS_PER_CLASS_ENGLISH = 500      # English CARDS examples PER CLASS
+    CARDS_PER_CLASS_TRANSLATED = 100   # translated examples PER CLASS PER language
     CACHE_DIR = "./cache"
-    SCRAPED_CACHE = os.path.join(CACHE_DIR, "scraped.pkl")
-    LABELLED_CACHE = os.path.join(CACHE_DIR, "labelled.pkl")
+    DATASET_CACHE = os.path.join(CACHE_DIR, "cards_dataset.pkl")
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    # ---- data -> scrape -> label -> backfill, with staged caching ----
-    if USE_CACHE and os.path.exists(LABELLED_CACHE):
-        print(f"[cache] loading labelled data from {LABELLED_CACHE}")
-        climate_df_labelled = pd.read_pickle(LABELLED_CACHE)
+    # Build a BALANCED, multilingual CARDS dataset. Both denial and not-denial
+    # come from the SAME source (CARDS) and the SAME translation process, so the
+    # classifier cannot cheat on source/style and must learn denial *content*.
+    # (This replaces the earlier GDELT-negatives + denial-only-backfill design,
+    # which produced a source/style confound and fake-perfect scores.)
+    if USE_CACHE and os.path.exists(DATASET_CACHE):
+        print(f"[cache] loading CARDS dataset from {DATASET_CACHE}")
+        dataset = pd.read_pickle(DATASET_CACHE)
     else:
-        if USE_CACHE and os.path.exists(SCRAPED_CACHE):
-            print(f"[cache] loading scraped data from {SCRAPED_CACHE}")
-            climate_df_scraped = pd.read_pickle(SCRAPED_CACHE)
-        else:
-            print("read df")
-            df = read_df()
-            print("filter on climate df")
-            climate_df = cretate_climate_df(df)
-            print("scrape for full articles")
-            climate_df_scraped = add_full_text_to_df(
-                climate_df, limit=100, max_workers=SCRAPE_WORKERS
-            )
-            if USE_CACHE:
-                climate_df_scraped.to_pickle(SCRAPED_CACHE)
-                print(f"[cache] saved scraped data -> {SCRAPED_CACHE}")
-
-        # Stage 2: binary denial labels via CARDS (+ NLLB translation for
-        # non-English). Drop rows we could not label (unmapped language).
-        print("label denial (CARDS + translation)")
-        climate_df_labelled = add_denial_labels(climate_df_scraped)
-        climate_df_labelled = climate_df_labelled.dropna(
-            subset=["DenialLabel"]
-        ).reset_index(drop=True)
-        climate_df_labelled["DenialLabel"] = climate_df_labelled[
-            "DenialLabel"
-        ].astype(int)
-
-        # Stage 3 backfill: strengthen the (minority) denial class with CARDS
-        # examples, translated into the languages present in our GDELT data.
-        if USE_CARDS_BACKFILL:
-            print("backfill denial class from CARDS")
-            target_langs = sorted(set(climate_df_labelled["Language"]))
-            cards_df = backfill_denial(
-                target_languages=target_langs,
-                max_english=CARDS_MAX_ENGLISH,
-                per_language=CARDS_PER_LANGUAGE,
-            )
-            climate_df_labelled = pd.concat(
-                [climate_df_labelled, cards_df], ignore_index=True
-            )
-
+        print("build balanced multilingual CARDS dataset")
+        dataset = build_cards_dataset(
+            target_languages=TARGET_LANGUAGES,
+            per_class_english=CARDS_PER_CLASS_ENGLISH,
+            per_class_translated=CARDS_PER_CLASS_TRANSLATED,
+        )
         if USE_CACHE:
-            climate_df_labelled.to_pickle(LABELLED_CACHE)
-            print(f"[cache] saved labelled data -> {LABELLED_CACHE}")
+            dataset.to_pickle(DATASET_CACHE)
+            print(f"[cache] saved CARDS dataset -> {DATASET_CACHE}")
 
-    embs = create_embedding(climate_df_labelled, rebuild=REBUILD_EMBEDDINGS)
+    embs = create_embedding(dataset, rebuild=REBUILD_EMBEDDINGS)
 
     data = embs.get(include=["embeddings", "metadatas"])
 
-    # X is the multilingual embeddings of the original-language text
+    # X is the multilingual embeddings of the (original or translated) text
     X_embeddings = np.array(data["embeddings"])
 
-    # y is now the REAL denial label (0/1) from Stage 2, not the tone proxy
+    # y is the denial label (0/1); both classes share source + languages
     metadatas = data["metadatas"]
     y_labels = np.array([int(meta["label"]) for meta in metadatas])
     languages = [str(meta["language"]) for meta in metadatas]
 
-    # Stage 3: inspect the language x label distribution (flag sparse cells)
+    # Stage 3: inspect the language x label distribution (should be balanced now)
     print_language_label_crosstab(languages, y_labels)
 
     # Stage 6: overall + per-language macro-F1 evaluation
@@ -485,6 +454,11 @@ if __name__ == "__main__":
 
     # Stage 6: cross-lingual transfer (train on some languages, test held-out one)
     auto_cross_lingual(X_embeddings, y_labels, languages)
+
+    # NOTE: GDELT remains available (read_df / cretate_climate_df /
+    # add_full_text_to_df / add_denial_labels) to APPLY the trained detector to
+    # real news as a separate step - but it is not used for training here,
+    # since mainstream GDELT news contains almost no denial.
 
 
 

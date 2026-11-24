@@ -59,40 +59,42 @@ def download_cards_data(cache_dir: str = CACHE_DIR) -> str:
     return training_csv
 
 
-def _denial_rows_to_df(texts, language: str, source: str) -> pd.DataFrame:
-    """Build a pipeline-compatible denial dataframe from a list of texts."""
+def _rows_to_df(texts, language: str, label: int, source: str) -> pd.DataFrame:
+    """Build a pipeline-compatible dataframe for one (language, label) group."""
     n = len(texts)
     return pd.DataFrame(
         {
             "FullText": [str(t) for t in texts],
             "Language": language,
-            "DenialLabel": 1,
-            "DenialScore": 1.0,
+            "DenialLabel": int(label),
+            "DenialScore": float(label),
             # Columns the embedding step expects:
             "SourceCommonName": source,
-            "DocumentIdentifier": [f"cards://{language}/{i}" for i in range(n)],
+            "DocumentIdentifier": [
+                f"cards://{source}/{language}/{label}/{i}" for i in range(n)
+            ],
             "DATE": 0,
             "Tone": "0,0,0,0,0,0",
         }
     )
 
 
-def load_cards_denial(
+def load_cards_examples(
     cache_dir: str = CACHE_DIR,
     split: str = "training",
+    denial: bool = True,
     max_examples: int = None,
     random_state: int = 42,
-) -> pd.DataFrame:
-    """Load English CARDS denial (contrarian) paragraphs as a denial dataframe.
+):
+    """Load English CARDS examples of ONE class.
 
     Args:
-        cache_dir: where CARDS data is cached/downloaded.
-        split: one of 'training', 'validation', 'test'.
-        max_examples: cap the number of denial rows (random sample) if set.
-        random_state: sampling seed.
+        denial: if True, return contrarian paragraphs (claim != '0_0');
+            if False, return non-contrarian paragraphs (claim == '0_0').
+        max_examples: cap (random sample) if set.
 
     Returns:
-        DataFrame with FullText / Language='eng' / DenialLabel=1 (+ metadata).
+        List of English texts for the requested class.
     """
     csv_path = os.path.join(cache_dir, "data", "training", f"{split}.csv")
     if not os.path.exists(csv_path):
@@ -100,68 +102,78 @@ def load_cards_denial(
         csv_path = os.path.join(cache_dir, "data", "training", f"{split}.csv")
 
     df = pd.read_csv(csv_path)
-    df["_denial"] = (df["claim"].astype(str) != NO_CLAIM_CODE).astype(int)
-    denial = df[df["_denial"] == 1]
-    if max_examples is not None and len(denial) > max_examples:
-        denial = denial.sample(max_examples, random_state=random_state)
-
-    out = _denial_rows_to_df(denial["text"].tolist(), "eng", "CARDS")
-    print(f"[cards] loaded {len(out)} English denial examples from "
-          f"CARDS '{split}' split")
-    return out.reset_index(drop=True)
+    is_denial = df["claim"].astype(str) != NO_CLAIM_CODE
+    sub = df[is_denial] if denial else df[~is_denial]
+    if max_examples is not None and len(sub) > max_examples:
+        sub = sub.sample(max_examples, random_state=random_state)
+    return sub["text"].astype(str).tolist()
 
 
-def backfill_denial(
+def build_cards_dataset(
     target_languages=None,
-    max_english: int = 500,
-    per_language: int = 100,
+    per_class_english: int = 500,
+    per_class_translated: int = 100,
     translate_backfill: bool = True,
     cache_dir: str = CACHE_DIR,
     random_state: int = 42,
 ) -> pd.DataFrame:
-    """Build a CARDS denial backfill set, optionally translated to other langs.
+    """Build a BALANCED, multilingual CARDS dataset (both classes).
+
+    Both the denial and not-denial classes are drawn from the SAME source
+    (CARDS) and translated into the SAME target languages, so the classifier
+    cannot separate them by source/style - it must learn denial *content*.
+    This removes the source/style confound that arises when denial comes only
+    from CARDS and not-denial only from GDELT news.
 
     Args:
-        target_languages: iterable of GDELT language codes to create denial
-            examples in (e.g. ['spa', 'deu']). 'eng' is ignored (already native).
-        max_english: cap on English CARDS denial examples kept.
-        per_language: how many English denial examples to translate into EACH
-            target language.
-        translate_backfill: if False, only the English CARDS denial is returned
-            (no translation performed).
-        cache_dir: CARDS cache dir.
+        target_languages: GDELT language codes to create coverage for
+            (e.g. ['spa', 'deu']); 'eng' is always included natively.
+        per_class_english: English examples PER CLASS (denial / not-denial).
+        per_class_translated: examples PER CLASS translated into EACH target
+            language.
+        translate_backfill: if False, only the English CARDS data is returned.
 
     Returns:
-        Concatenated denial dataframe (English + translated), pipeline-ready.
+        Balanced, pipeline-ready dataframe (FullText / Language / DenialLabel ...).
     """
-    english = load_cards_denial(
-        cache_dir=cache_dir, max_examples=max_english, random_state=random_state
+    denial_en = load_cards_examples(
+        cache_dir=cache_dir, denial=True,
+        max_examples=per_class_english, random_state=random_state,
     )
-    frames = [english]
+    notden_en = load_cards_examples(
+        cache_dir=cache_dir, denial=False,
+        max_examples=per_class_english, random_state=random_state,
+    )
+    frames = [
+        _rows_to_df(denial_en, "eng", 1, "CARDS"),
+        _rows_to_df(notden_en, "eng", 0, "CARDS"),
+    ]
 
     if translate_backfill and target_languages:
         # Imported here so this module stays importable without torch
         from labelling import translate as nllb_translate, gdelt_to_nllb, TARGET_LANG
 
-        pool = english["FullText"].tolist()
+        denial_pool = denial_en[:per_class_translated]
+        notden_pool = notden_en[:per_class_translated]
         for lang in target_languages:
             if lang == "eng":
                 continue
             tgt_code = gdelt_to_nllb(lang)
             if tgt_code is None:
-                print(f"[cards] no NLLB code for '{lang}', skipping backfill")
+                print(f"[cards] no NLLB code for '{lang}', skipping")
                 continue
-            source_texts = pool[:per_language]
-            if not source_texts:
-                continue
-            print(f"[cards] translating {len(source_texts)} denial examples "
-                  f"-> '{lang}' ({tgt_code})")
-            translated = nllb_translate(source_texts, TARGET_LANG, tgt_code)
-            frames.append(
-                _denial_rows_to_df(translated, lang, "CARDS-translated")
-            )
+            print(f"[cards] translating {len(denial_pool)} denial + "
+                  f"{len(notden_pool)} not-denial -> '{lang}' ({tgt_code})")
+            if denial_pool:
+                den_tr = nllb_translate(denial_pool, TARGET_LANG, tgt_code)
+                frames.append(_rows_to_df(den_tr, lang, 1, "CARDS-translated"))
+            if notden_pool:
+                not_tr = nllb_translate(notden_pool, TARGET_LANG, tgt_code)
+                frames.append(_rows_to_df(not_tr, lang, 0, "CARDS-translated"))
 
-    result = pd.concat(frames, ignore_index=True)
-    print(f"[cards] backfill total: {len(result)} denial examples across "
+    result = pd.concat(frames, ignore_index=True).reset_index(drop=True)
+    n_den = int((result["DenialLabel"] == 1).sum())
+    print(f"[cards] balanced dataset: {len(result)} rows "
+          f"({n_den} denial / {len(result) - n_den} not-denial) across "
           f"{result['Language'].nunique()} language(s)")
     return result
