@@ -23,3 +23,4 @@ gdown
 
 # Classifier (Stage 5)
 scikit-learn
+joblib                   # model persistence (save/load trained classifier)

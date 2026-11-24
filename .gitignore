@@ -12,3 +12,6 @@ cards_data/
 
 # Pipeline caches (scraped/labelled intermediates)
 cache/
+
+# Saved model artifacts
+model/

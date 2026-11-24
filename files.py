@@ -22,6 +22,8 @@ from evaluation import (
     print_language_label_crosstab,
     evaluate,
     auto_cross_lingual,
+    fit_full_model,
+    save_model,
 )
 
 HEADERS = {
@@ -454,6 +456,18 @@ if __name__ == "__main__":
 
     # Stage 6: cross-lingual transfer (train on some languages, test held-out one)
     auto_cross_lingual(X_embeddings, y_labels, languages)
+
+    # Train a final model on ALL data and persist it for prediction (predict.py)
+    MODEL_PATH = "./model/denial_clf.joblib"
+    print("\ntrain + save final model on all data")
+    final_model = fit_full_model(X_embeddings, y_labels)
+    save_model(
+        final_model,
+        MODEL_PATH,
+        embedding_model="microsoft/harrier-oss-v1-270m",
+        target_names=["Not Denial", "Denial"],
+        max_chars=2000,
+    )
 
     # NOTE: GDELT remains available (read_df / cretate_climate_df /
     # add_full_text_to_df / add_denial_labels) to APPLY the trained detector to

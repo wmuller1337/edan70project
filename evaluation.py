@@ -15,6 +15,7 @@ by the majority.
 
 from collections import Counter
 
+import joblib
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, cross_val_score
@@ -202,3 +203,45 @@ def auto_cross_lingual(X, y, languages, min_rows: int = 10):
     held_out = str(max(candidates, key=lambda t: t[1])[0])
     train_langs = [str(l) for l in set(languages) if str(l) != held_out]
     return cross_lingual_transfer(X, y, languages, train_langs, held_out)
+
+
+# ---------------------------------------------------------------------------
+# Model persistence (train a deployable model on ALL data, save/load)
+# ---------------------------------------------------------------------------
+def fit_full_model(X, y, C: float = 10.0, random_state: int = 42):
+    """Train logistic regression on ALL data (for deployment / prediction)."""
+    X = np.asarray(X)
+    y = np.asarray(y).astype(int)
+    model = _make_lr(C=C, random_state=random_state)
+    model.fit(X, y)
+    return model
+
+
+def save_model(
+    model,
+    path: str,
+    embedding_model: str,
+    target_names=("Not Denial", "Denial"),
+    max_chars: int = 2000,
+):
+    """Persist the classifier plus everything needed to reproduce inference.
+
+    The bundle stores the embedding model name and the char-truncation length
+    so prediction embeds new text exactly the way training did.
+    """
+    import os
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    bundle = {
+        "model": model,
+        "embedding_model": embedding_model,
+        "target_names": list(target_names),
+        "max_chars": max_chars,
+    }
+    joblib.dump(bundle, path)
+    print(f"[model] saved classifier bundle -> {path}")
+
+
+def load_model(path: str) -> dict:
+    """Load a model bundle saved by save_model()."""
+    return joblib.load(path)
