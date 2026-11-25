@@ -17,7 +17,7 @@ import requests
 import trafilatura
 
 from labelling import add_denial_labels
-from cards_backfill import build_cards_dataset
+from cards_backfill import build_cards_dataset, combine_balanced
 from evaluation import (
     print_language_label_crosstab,
     evaluate,
@@ -403,33 +403,61 @@ if __name__ == "__main__":
     # ----- pipeline configuration -----
     REBUILD_EMBEDDINGS = True   # False -> reuse existing Chroma collection
     USE_CACHE = True            # cache the built dataset to skip recompute
-    # Languages to build multilingual coverage for (translated from English
-    # via NLLB). 'eng' is always included natively.
     TARGET_LANGUAGES = ["spa", "deu", "fra", "por", "rus", "zho"]
     CARDS_PER_CLASS_ENGLISH = 500      # English CARDS examples PER CLASS
     CARDS_PER_CLASS_TRANSLATED = 100   # translated examples PER CLASS PER language
+    # Improvement: mix REAL GDELT mainstream climate news into the not-denial
+    # class so the model learns what non-denial climate writing looks like
+    # (fixes mainstream articles being flagged as denial).
+    USE_GDELT_NEGATIVES = True
+    GDELT_NEG_LIMIT = 300       # GDELT articles to scrape as not-denial examples
+    SCRAPE_WORKERS = 12
     CACHE_DIR = "./cache"
-    DATASET_CACHE = os.path.join(CACHE_DIR, "cards_dataset.pkl")
+    DATASET_CACHE = os.path.join(CACHE_DIR, "dataset.pkl")
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    # Build a BALANCED, multilingual CARDS dataset. Both denial and not-denial
-    # come from the SAME source (CARDS) and the SAME translation process, so the
-    # classifier cannot cheat on source/style and must learn denial *content*.
-    # (This replaces the earlier GDELT-negatives + denial-only-backfill design,
-    # which produced a source/style confound and fake-perfect scores.)
+    STD_COLS = [
+        "FullText", "Language", "DenialLabel", "DenialScore",
+        "SourceCommonName", "DocumentIdentifier", "DATE", "Tone",
+    ]
+
     if USE_CACHE and os.path.exists(DATASET_CACHE):
-        print(f"[cache] loading CARDS dataset from {DATASET_CACHE}")
+        print(f"[cache] loading dataset from {DATASET_CACHE}")
         dataset = pd.read_pickle(DATASET_CACHE)
     else:
         print("build balanced multilingual CARDS dataset")
-        dataset = build_cards_dataset(
+        cards = build_cards_dataset(
             target_languages=TARGET_LANGUAGES,
             per_class_english=CARDS_PER_CLASS_ENGLISH,
             per_class_translated=CARDS_PER_CLASS_TRANSLATED,
         )
+
+        if USE_GDELT_NEGATIVES:
+            # Scrape real GDELT mainstream climate news; keep the not-denial
+            # ones as realistic negative examples.
+            print("scrape GDELT climate news for realistic not-denial examples")
+            gdf = read_df()
+            gclimate = cretate_climate_df(gdf)
+            gscraped = add_full_text_to_df(
+                gclimate, limit=GDELT_NEG_LIMIT, max_workers=SCRAPE_WORKERS
+            )
+            print("label GDELT news (keep not-denial only)")
+            glabelled = add_denial_labels(gscraped)
+            gnews_neg = glabelled[glabelled["DenialLabel"] == 0].copy()
+            gnews_neg["DenialLabel"] = 0
+            gnews_neg["DenialScore"] = gnews_neg["DenialScore"].fillna(0.0)
+            gnews_neg = gnews_neg[STD_COLS]
+
+            # Balance: denial from CARDS vs a mix of CARDS-neutral + GDELT news
+            denial = cards[cards["DenialLabel"] == 1]
+            cards_neg = cards[cards["DenialLabel"] == 0][STD_COLS]
+            dataset = combine_balanced(denial[STD_COLS], [cards_neg, gnews_neg])
+        else:
+            dataset = cards
+
         if USE_CACHE:
             dataset.to_pickle(DATASET_CACHE)
-            print(f"[cache] saved CARDS dataset -> {DATASET_CACHE}")
+            print(f"[cache] saved dataset -> {DATASET_CACHE}")
 
     embs = create_embedding(dataset, rebuild=REBUILD_EMBEDDINGS)
 

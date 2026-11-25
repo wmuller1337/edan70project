@@ -177,3 +177,32 @@ def build_cards_dataset(
           f"({n_den} denial / {len(result) - n_den} not-denial) across "
           f"{result['Language'].nunique()} language(s)")
     return result
+
+
+def combine_balanced(positive_df, negative_dfs, random_state: int = 42):
+    """Combine a positive (denial) frame with one or more negative frames,
+    downsampling the negative pool to match the positive count, then shuffle.
+
+    Use this to mix negatives from different sources (e.g. CARDS not-denial +
+    real GDELT climate news) while keeping the two classes balanced.
+
+    Args:
+        positive_df: denial rows (DenialLabel == 1).
+        negative_dfs: list of not-denial frames (DenialLabel == 0).
+        random_state: sampling/shuffle seed.
+
+    Returns:
+        Balanced, shuffled dataframe.
+    """
+    negatives = pd.concat(list(negative_dfs), ignore_index=True)
+    n_pos = len(positive_df)
+    if len(negatives) > n_pos:
+        negatives = negatives.sample(n_pos, random_state=random_state)
+    combined = pd.concat([positive_df, negatives], ignore_index=True)
+    # shuffle so classes/sources are interleaved
+    combined = combined.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    n_den = int((combined["DenialLabel"] == 1).sum())
+    print(f"[combine] balanced set: {len(combined)} rows "
+          f"({n_den} denial / {len(combined) - n_den} not-denial); "
+          f"negatives from {negatives['SourceCommonName'].nunique()} source name(s)")
+    return combined
