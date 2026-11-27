@@ -12,6 +12,8 @@ model supports.
 """
 
 import argparse
+import os
+from newspaper import Article
 
 import numpy as np
 
@@ -90,7 +92,21 @@ def predict_file(txt_path, model_path="./model/denial_clf.joblib"):
     print(f"Prediction:  {result['label_name']}")
     print(f"Denial prob: {result['denial_prob']:.3f}")
     return result
-
+def scrape_url_to_file(url: str, output_path: str = "scraped_article.txt") -> str:
+    """Scrape the main text content from a URL and save it to a .txt file."""
+    article = Article(url)
+    article.download()
+    article.parse()
+    
+    text = article.text.strip()
+    if not text:
+        raise ValueError(f"No text found in URL: {url}")
+        
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(text)
+        
+    print(f"Scraped {len(text)} characters and saved to: {output_path}")
+    return output_path
 
 def main():
     parser = argparse.ArgumentParser(
@@ -102,8 +118,22 @@ def main():
         default="./model/denial_clf.joblib",
         help="Path to the saved model bundle (default: ./model/denial_clf.joblib)",
     )
+    parser.add_argument(
+            "--output_txt",
+            default="scraped_article.txt",
+            help="Filnamn för sparad text om en URL skrapas (default: scraped_article.txt)",
+        )
+    
     args = parser.parse_args()
-    predict_file(args.txt_file, model_path=args.model)
+    # Check if the input is a URL or a local file
+    target_file = args.txt_file
+    #target_file = args.input_source
+    if target_file.startswith(("http://", "https://")):
+        print(f"Fetching and scraping article from URL: {target_file}")
+        target_file = scrape_url_to_file(target_file, output_path=args.output_txt)
+    predict_file(target_file, model_path=args.model)
+
+
 
 
 if __name__ == "__main__":
