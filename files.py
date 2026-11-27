@@ -1,56 +1,30 @@
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 import zipfile
 import io
 import glob
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import chromadb
 from chromadb.utils import embedding_functions
-<<<<<<< HEAD
-from newspaper import Article
-
-def scrape_article_text(url):
-    try:
-        # scrape the article text using newspaper3k
-        article = Article(url, request_timeout=5)
-        article.download()
-        article.parse()
-        
-        # article.text contains ONLY the main body of the article
-        return article.text
-    except Exception as e:
-        # If scraping fails return an empty string
-        return ""
-
-def add_full_text_to_df(df, limit=20):
-    print(f"Scraping full text for the first {limit} articles...")
-    
-    # Working on a copy of the sample
-    sample_df = df.head(limit).copy()
-    
-    # Getting the main text for each URL
-    sample_df["FullText"] = sample_df["DocumentIdentifier"].apply(scrape_article_text)
-    
-    # Filter out articles where scraping failed (empty text)
-    successful = sample_df[sample_df["FullText"].str.len() > 0]
-    print(f"Successfully scraped {len(successful)} out of {limit} articles.")
-    
-    return sample_df
-    
-=======
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    roc_auc_score,
-)
-from sklearn.model_selection import cross_validate, train_test_split, TunedThresholdClassifierCV
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import cross_val_score, train_test_split
 from newspaper import Article, ArticleException
 import requests
 import trafilatura
->>>>>>> origin/wilmas_branch
+
+from labelling import add_denial_labels
+from cards_backfill import build_cards_dataset
+from evaluation import (
+    print_language_label_crosstab,
+    evaluate,
+    auto_cross_lingual,
+    fit_full_model,
+    save_model,
+)
 
 HEADERS = {
     "User-Agent": (
@@ -62,7 +36,23 @@ HEADERS = {
 
 
 def scrape_article_text(url):
-    
+    """Extract the main body text of an article.
+
+    Tries newspaper3k first; if that fails or returns too little text,
+    falls back to trafilatura. Returns an empty string if both fail.
+    """
+    # Method 1: newspaper3k
+    try:
+        article = Article(url, request_timeout=5)
+        article.download()
+        article.parse()
+        # article.text contains ONLY the main body of the article
+        if article.text and len(article.text.strip()) > 50:
+            return article.text.strip()
+    except Exception:
+        pass
+
+    # Method 2: fallback to trafilatura (now actually reachable)
     try:
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
@@ -70,49 +60,73 @@ def scrape_article_text(url):
                 downloaded,
                 include_comments=False,
                 include_tables=False,
+                fast=True,
             )
-            if extracted and len(extracted.strip()) >= 200:
+            if extracted and len(extracted.strip()) > 50:
                 return extracted.strip()
     except Exception:
         pass
 
-    # Method 2: Fallback to Trafilatura
-    try:
-        article = Article(url, request_timeout=5)
-        article.download()
-        article.parse()
-        if article.text and len(article.text.strip()) >= 200:
-            return article.text.strip()
-    except Exception:
-        pass
-
+    # If both methods fail, return an empty string
     return ""
 
+def add_full_text_to_df(df, limit=20, max_workers=12):
+    print(f"Scraping full text for up to {limit} articles "
+          f"({max_workers} parallel workers)...")
 
-def add_full_text_to_df(df, limit=20):
-    print(f"Scraping full text for the first {limit} articles...")
-    
+    # Deduplicate on the article URL so we don't scrape/embed the same
+    # article multiple times (and don't waste the limit on duplicates).
+    deduped = df.drop_duplicates(subset="DocumentIdentifier")
+
     # Working on a copy of the sample
-    sample_df = df.head(limit).copy() if limit is not None else df.copy()
-    
+    sample_df = deduped.head(limit).copy()
+
+    # Scrape concurrently - scraping is network-bound, so a thread pool gives
+    # a large wall-clock speedup. executor.map preserves input order.
     urls = sample_df["DocumentIdentifier"].tolist()
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        sample_df["FullText"] = list(executor.map(scrape_article_text, urls))
-    
-    # Filter out articles where scraping failed (empty text)
-    successful = sample_df[sample_df["FullText"].str.len() > 0]
-    print(f"Successfully scraped {len(successful)} out of {limit} articles.")
-    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        texts = list(executor.map(scrape_article_text, urls))
+    sample_df["FullText"] = texts
+
+    # Keep only articles where scraping actually produced text
+    successful = sample_df[sample_df["FullText"].str.len() > 0].reset_index(drop=True)
+    print(f"Successfully scraped {len(successful)} out of {len(sample_df)} articles.")
+
+    # Return the filtered successful frame so empty scrapes don't flow downstream
     return successful
+
+def parse_source_language(translation_info):
+    """Return the source-language code for a GKG record.
+
+    GDELT's translingual stream stores the original language in the
+    TranslationInfo field as "srclc:<lang>;eng:<engine>;...". English-origin
+    records (from the English stream) have an empty field, which we map to
+    "eng".
+    """
+    text = str(translation_info) if translation_info is not None else ""
+    match = re.search(r"srclc:(\w+)", text)
+    return match.group(1) if match else "eng"
+
 
 def read_df():
 
-    #  download for a single 15-minute chunk
-    urls = [
-            f"http://data.gdeltproject.org/gdeltv2/20240501{hour:02d}{minute:02d}00.gkg.csv.zip"
-            for hour in range(0, 24, 2)  # Every 2 hours across the day
-            for minute in (0, 30)  # At 00 and 30 minutes
-        ]
+    # Build timestamps for every 2 hours across the day, at :00 and :30
+    timestamps = [
+        f"20240501{hour:02d}{minute:02d}00"
+        for hour in range(0, 24, 2)
+        for minute in (0, 30)
+    ]
+
+    # Download BOTH GKG streams per timestamp:
+    #   <ts>.gkg.csv.zip              -> English-only stream
+    #   <ts>.translation.gkg.csv.zip  -> translingual stream (65+ languages,
+    #                                    machine-translated), which is what
+    #                                    makes the corpus actually multilingual.
+    base = "http://data.gdeltproject.org/gdeltv2"
+    urls = []
+    for ts in timestamps:
+        urls.append(f"{base}/{ts}.gkg.csv.zip")
+        urls.append(f"{base}/{ts}.translation.gkg.csv.zip")
 
     # Define the primary column names according to the GDELT GKG v2 schema
     COLUMN_NAMES = [
@@ -146,7 +160,14 @@ def read_df():
     ]
     
     
+    os.makedirs("./gkg_raw_data", exist_ok=True)
+
     for idx, url in enumerate(urls, 1):
+        # The extracted CSV has the same name as the zip minus ".zip".
+        expected = os.path.join("./gkg_raw_data", os.path.basename(url)[:-4])
+        if os.path.exists(expected):
+            # Already downloaded on a previous run; skip to save time/bandwidth.
+            continue
         try:
             response = urllib.request.urlopen(url)
             with zipfile.ZipFile(io.BytesIO(response.read())) as zip_file:
@@ -171,11 +192,19 @@ def read_df():
         df.append(df_single)
     
     df = pd.concat(df, ignore_index=True)
-    
+
+    # Derive a source-language field from the TranslationInfo column.
+    # English-origin records have an empty TranslationInfo; translingual
+    # records carry "srclc:<lang>;..." indicating the original language.
+    df["Language"] = df["TranslationInfo"].apply(parse_source_language)
+
     print(
         f"Successfully loaded total dataset of {len(df)} raw records."
     )
-    
+    lang_counts = df["Language"].value_counts()
+    print("Language distribution (top 10):")
+    print(lang_counts.head(10).to_string())
+
     return df
 
 
@@ -220,39 +249,58 @@ def cretate_climate_df(df):
     return climate_df     
             
             
-def create_embedding(df):     
+def create_embedding(df, rebuild=True):
     # setting up embeddings for articles
-            
+    #
+    # rebuild=True  -> delete any existing collection and embed from scratch.
+    # rebuild=False -> if a non-empty collection already exists, reuse it
+    #                  (skips re-embedding, which is the slow/expensive step).
+
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
-    # delete the existing collection if it exists, to start fresh
+
+    # Use GPU for embedding if available (falls back to CPU cleanly)
     try:
-        chroma_client.delete_collection("climate_denial_discourse")
-        print("Clearing existing database.")
+        import torch
+        embed_device = "cuda" if torch.cuda.is_available() else "cpu"
     except Exception:
-        pass  # If the collection doesn't exist, ignore the error
+        embed_device = "cpu"
 
     # setup embedding function
     sentence_transformer_ef = (
         embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="microsoft/harrier-oss-v1-270m"
+            model_name="microsoft/harrier-oss-v1-270m",
+            device=embed_device,
         )
     )
 
-<<<<<<< HEAD
-    collection = chroma_client.get_or_create_collection(
-        name="climate_denial_discourse",
-        embedding_function=sentence_transformer_ef,
-        metadata={"hnsw:space": "cosine"},  # cosine similarity
-    )
-=======
     collection_name = "climate_fulltext"
+
+    # Reuse path: if not rebuilding and a populated collection exists, return it.
+    if not rebuild:
+        existing = {c.name for c in chroma_client.list_collections()}
+        if collection_name in existing:
+            collection = chroma_client.get_collection(
+                name=collection_name,
+                embedding_function=sentence_transformer_ef,
+            )
+            if collection.count() > 0:
+                print(
+                    f"Reusing existing embedding collection "
+                    f"'{collection_name}' with {collection.count()} records "
+                    f"(rebuild=False). Pass rebuild=True to re-embed."
+                )
+                return collection
+            print(
+                f"Collection '{collection_name}' exists but is empty; "
+                f"rebuilding."
+            )
+
+    # Rebuild path: drop any existing collection and re-create it.
     try:
         chroma_client.delete_collection(name=collection_name)
     except Exception:
         pass
->>>>>>> origin/wilmas_branch
 
-    
     collection = chroma_client.create_collection(
         name=collection_name,
         embedding_function=sentence_transformer_ef,
@@ -264,22 +312,8 @@ def create_embedding(df):
     ids = []
 
     for idx, row in df.iterrows():
-<<<<<<< HEAD
-        # Check if scraped full text exists and is not empty
-        full_text = str(row.get("FullText", "")).strip()
-        
-        if full_text:
-            # Including the source and the first 1500 chars of full text
-            # all-MiniLM-L6-v2 will automatically truncate at 256 tokens anyways
-            # first 1500 characters is reasonable for context
-            doc_text = f"Source: {row['SourceCommonName']}. Text: {full_text[:1500]}"
-        else:
-            continue  # Skip this record if no full text is available (change if we want to include records without full text)
-
-=======
         # Embed the actual scraped article text (first 2000 chars)
         doc_text = str(row["FullText"])[:2000]
->>>>>>> origin/wilmas_branch
         avg_tone = float(str(row["Tone"]).split(",")[0])
 
         documents.append(doc_text)
@@ -287,25 +321,14 @@ def create_embedding(df):
             "source": str(row["SourceCommonName"]),
             "date": int(row["DATE"]),
             "url": str(row["DocumentIdentifier"]),
-            "tone": avg_tone
+            "tone": avg_tone,
+            "language": str(row["Language"]),
+            # Real denial label from Stage 2 (CARDS + translation)
+            "label": int(row["DenialLabel"]),
+            "denial_score": float(row["DenialScore"]),
         })
         ids.append(f"doc_{idx}")
 
-<<<<<<< HEAD
-    if documents:
-        collection.add(documents=documents, metadatas=metadatas, ids=ids)
-        print(f"Stored {len(documents)} articles with full text. Total in database: {collection.count()}")
-    else:
-        print("No articles with full text found to save.")
-
-# retrieve the dataframe, filter for climate articles
-df = read_df()
-climate_df = cretate_climate_df(df)
-# Scrape full text andadd it to the dataframe (limit=20 for testing purposes)
-climate_df_scraped = add_full_text_to_df(climate_df, limit=20)
-# Create embeddings for the scraped articles and store them in the ChromaDB collection
-create_embedding(climate_df_scraped)
-=======
     collection.add(documents=documents, metadatas=metadatas, ids=ids)
     print(
         f"Successfully stored full-text embeddings! Total records in Chroma: {collection.count()}"
@@ -314,95 +337,40 @@ create_embedding(climate_df_scraped)
     return collection
 
 
-def build_multiclass_labels(metadatas: list, mode: str = "3class_polarity"):
-    """
-    mode='3class_polarity':
-        0 = Crisis / Alarmist (tone <= -2.5)
-        1 = Neutral / Procedural (-2.5 < tone < 1.0)
-        2 = Solution / Resilience (tone >= 1.0)
-
-    mode='4class_framing':
-        0 = Humanitarian & Displacement
-        1 = Policy, Law & Governance
-        2 = Economic & Infrastructure
-        3 = Science, Environment & Disaster Impact (default climate frame)
-    """
-    if mode == "3class_polarity":
-        y = []
-        for meta in metadatas:
-            t = meta["tone"]
-            if t <= -2.5:
-                y.append(0)
-            elif t < 1.0:
-                y.append(1)
-            else:
-                y.append(2)
-        names = ["Crisis / Alarmist", "Neutral / Procedural", "Solution / Resilience"]
-        return np.array(y), names
-
-    elif mode == "4class_framing":
-        y = []
-        for meta in metadatas:
-            th = meta["themes"]
-            if any(k in th for k in ["REFUGEES", "HUMANITARIAN", "FAMINE", "DISPLACED", "POVERTY"]):
-                y.append(0)
-            elif any(k in th for k in ["LEGISLATION", "GOV_", "DIPLOMACY", "UNGP_", "ELECTION"]):
-                y.append(1)
-            elif any(k in th for k in ["ECON_", "AGRICULTURE", "INFRASTRUCTURE", "ENERGY", "TAX_"]):
-                y.append(2)
-            else:
-                y.append(3)
-        names = ["Humanitarian", "Policy & Governance", "Economic & Energy", "Environmental Impact"]
-        return np.array(y), names
-
-def classification(
-    X: np.ndarray,
+def classification(X: np.ndarray,
     y: np.ndarray,
     test_size: float = 0.2,
     random_state: int = 42,
-    C: float = 1.0,
+    C: float = 10.0,
     target_names: list = None,):
     
     X = np.array(X)
     y = np.array(y)
-    
-    names = target_names if target_names else [str(c) for c in np.unique(y)]
-    print(f"Class distribution: {dict(zip(names, np.bincount(y)))}\n")
     
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
     
     model = LogisticRegression(
+        max_iter=1000,
         C=C,
         class_weight="balanced",
-        max_iter=1000,
-        random_state=42,
+        random_state=random_state,
+        solver="lbfgs",
     )
-    
-    cv_results = cross_validate(
-        model, X_train, y_train, cv=5, scoring=["accuracy", "f1_macro"]
-    )
-    
     model.fit(X_train, y_train)
     
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test)
     
-    test_macro_f1 = f1_score(y_test, y_pred, average="macro")
-    print(f"Test Macro F1: {test_macro_f1:.4f}")
-    if y_proba.shape[1] == 2:
-        test_auc = roc_auc_score(y_test, y_proba[:, 1])
-    else:
-        test_auc = roc_auc_score(
-            y_test, y_proba, multi_class="ovr", average="macro"
-        )
-    print(f"Test Macro ROC-AUC: {test_auc:.4f}\n")
-
-    # 3. Per-class breakdown & confusion matrix
-    print(classification_report(y_test, y_pred, target_names=names))
-    print("Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    cv_scores = cross_val_score(model, X, y, cv=5, scoring="accuracy")
+    
+    print("==================================================")
+    print("         LOGISTIC REGRESSION EVALUATION          ")
+    print("==================================================")
+    print(
+        f"5-Fold Cross-Validation Accuracy: {cv_scores.mean():.4f} (± {cv_scores.std():.4f})\n"
+    )
 
     names = (
         target_names
@@ -423,7 +391,7 @@ def classification(
         "y_test": y_test,
         "y_pred": y_pred,
         "y_proba": y_proba,
-        "cv_scores": cv_results,
+        "cv_scores": cv_scores,
         "confusion_matrix": cm,
     }
 
@@ -431,50 +399,80 @@ def classification(
 
 
 
-# --- RUN PIPELINE (Bottom of files.py) ---
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="microsoft/harrier-oss-v1-270m"
-)
+if __name__ == "__main__":
+    # ----- pipeline configuration -----
+    REBUILD_EMBEDDINGS = True   # False -> reuse existing Chroma collection
+    USE_CACHE = True            # cache the built dataset to skip recompute
+    # Languages to build multilingual coverage for (translated from English
+    # via NLLB). 'eng' is always included natively.
+    TARGET_LANGUAGES = ["spa", "deu", "fra", "por", "rus", "zho"]
+    CARDS_PER_CLASS_ENGLISH = 500      # English CARDS examples PER CLASS
+    CARDS_PER_CLASS_TRANSLATED = 100   # translated examples PER CLASS PER language
+    CACHE_DIR = "./cache"
+    DATASET_CACHE = os.path.join(CACHE_DIR, "cards_dataset.pkl")
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
-embs = chroma_client.get_or_create_collection(
-    name="climate_fulltext_harrier",
-    embedding_function=sentence_transformer_ef,
-    metadata={"hnsw:space": "cosine"},
-)
+    # Build a BALANCED, multilingual CARDS dataset. Both denial and not-denial
+    # come from the SAME source (CARDS) and the SAME translation process, so the
+    # classifier cannot cheat on source/style and must learn denial *content*.
+    # (This replaces the earlier GDELT-negatives + denial-only-backfill design,
+    # which produced a source/style confound and fake-perfect scores.)
+    if USE_CACHE and os.path.exists(DATASET_CACHE):
+        print(f"[cache] loading CARDS dataset from {DATASET_CACHE}")
+        dataset = pd.read_pickle(DATASET_CACHE)
+    else:
+        print("build balanced multilingual CARDS dataset")
+        dataset = build_cards_dataset(
+            target_languages=TARGET_LANGUAGES,
+            per_class_english=CARDS_PER_CLASS_ENGLISH,
+            per_class_translated=CARDS_PER_CLASS_TRANSLATED,
+        )
+        if USE_CACHE:
+            dataset.to_pickle(DATASET_CACHE)
+            print(f"[cache] saved CARDS dataset -> {DATASET_CACHE}")
 
-# Only scrape and embed if the collection is empty
-if embs.count() == 0:
-    print("Collection empty — running full scrape and embedding pipeline...")
-    df = read_df()
-    climate_df = cretate_climate_df(df)
-    climate_df_scraped = add_full_text_to_df(climate_df, limit=None)
-    embs = create_embedding(climate_df_scraped)
-else:
-    print(f"Loaded {embs.count()} existing embeddings from ChromaDB.")
+    embs = create_embedding(dataset, rebuild=REBUILD_EMBEDDINGS)
 
-data = embs.get(include=["embeddings", "metadatas"])
-X_embeddings = np.array(data["embeddings"])
-metadatas = data["metadatas"]
+    data = embs.get(include=["embeddings", "metadatas"])
 
-# 1. Evaluate 3-Class Polarity
-print("\n>>> EVALUATING 3-CLASS POLARITY <<<")
-y_3class, names_3class = build_multiclass_labels(metadatas, mode="3class_polarity")
-model_3class, results_3class = classification(
-    X=X_embeddings,
-    y=y_3class,
-    target_names=names_3class,
-)
+    # X is the multilingual embeddings of the (original or translated) text
+    X_embeddings = np.array(data["embeddings"])
 
-# 2. Evaluate 4-Class Substantive Framing
-print("\n>>> EVALUATING 4-CLASS SUBSTANTIVE FRAMING <<<")
-y_4class, names_4class = build_multiclass_labels(metadatas, mode="4class_framing")
-model_4class, results_4class = classification(
-    X=X_embeddings,
-    y=y_4class,
-    target_names=names_4class,
-)
+    # y is the denial label (0/1); both classes share source + languages
+    metadatas = data["metadatas"]
+    y_labels = np.array([int(meta["label"]) for meta in metadatas])
+    languages = [str(meta["language"]) for meta in metadatas]
+
+    # Stage 3: inspect the language x label distribution (should be balanced now)
+    print_language_label_crosstab(languages, y_labels)
+
+    # Stage 6: overall + per-language macro-F1 evaluation
+    trained_model = evaluate(
+        X_embeddings,
+        y_labels,
+        languages,
+        target_names=["Not Denial", "Denial"],
+    )
+
+    # Stage 6: cross-lingual transfer (train on some languages, test held-out one)
+    auto_cross_lingual(X_embeddings, y_labels, languages)
+
+    # Train a final model on ALL data and persist it for prediction (predict.py)
+    MODEL_PATH = "./model/denial_clf.joblib"
+    print("\ntrain + save final model on all data")
+    final_model = fit_full_model(X_embeddings, y_labels)
+    save_model(
+        final_model,
+        MODEL_PATH,
+        embedding_model="microsoft/harrier-oss-v1-270m",
+        target_names=["Not Denial", "Denial"],
+        max_chars=2000,
+    )
+
+    # NOTE: GDELT remains available (read_df / cretate_climate_df /
+    # add_full_text_to_df / add_denial_labels) to APPLY the trained detector to
+    # real news as a separate step - but it is not used for training here,
+    # since mainstream GDELT news contains almost no denial.
 
 
 
->>>>>>> origin/wilmas_branch
