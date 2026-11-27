@@ -326,6 +326,8 @@ def create_embedding(df, rebuild=True):
             # Real denial label from Stage 2 (CARDS + translation)
             "label": int(row["DenialLabel"]),
             "denial_score": float(row["DenialScore"]),
+            # Group id for leakage-free (claim-grouped) evaluation
+            "claim_id": str(row["claim_id"]) if "claim_id" in row else f"doc_{idx}",
         })
         ids.append(f"doc_{idx}")
 
@@ -406,18 +408,27 @@ if __name__ == "__main__":
     TARGET_LANGUAGES = ["spa", "deu", "fra", "por", "rus", "zho"]
     CARDS_PER_CLASS_ENGLISH = 500      # English CARDS examples PER CLASS
     CARDS_PER_CLASS_TRANSLATED = 100   # translated examples PER CLASS PER language
-    # Improvement: mix REAL GDELT mainstream climate news into the not-denial
-    # class so the model learns what non-denial climate writing looks like
-    # (fixes mainstream articles being flagged as denial).
+    # Mix REAL GDELT mainstream climate news into the not-denial class so the
+    # model learns what non-denial climate writing looks like.
     USE_GDELT_NEGATIVES = True
     GDELT_NEG_LIMIT = 300       # GDELT articles to scrape as not-denial examples
     SCRAPE_WORKERS = 12
+    # #3: add NEWS/BLOG-style denial from contrarian outlets so the DENIAL class
+    # also contains real web-article text (not only CARDS think-tank prose).
+    USE_CONTRARIAN_DENIAL = True
+    CONTRARIAN_MAX_PER_SOURCE = 50
+    # #9: export a human gold slice for label validation.
+    EXPORT_GOLD_SLICE = True
+    GOLD_SLICE_PATH = "./gold_slice.csv"
+    GOLD_SLICE_N = 150
     CACHE_DIR = "./cache"
     DATASET_CACHE = os.path.join(CACHE_DIR, "dataset.pkl")
     os.makedirs(CACHE_DIR, exist_ok=True)
 
+    # #1: claim_id is carried through so train/test splits can be GROUPED
+    # (all translations of a claim stay on the same side -> no leakage).
     STD_COLS = [
-        "FullText", "Language", "DenialLabel", "DenialScore",
+        "FullText", "Language", "DenialLabel", "DenialScore", "claim_id",
         "SourceCommonName", "DocumentIdentifier", "DATE", "Tone",
     ]
 
@@ -432,9 +443,21 @@ if __name__ == "__main__":
             per_class_translated=CARDS_PER_CLASS_TRANSLATED,
         )
 
+        # ----- assemble denial (positive) pool -----
+        denial_frames = [cards[cards["DenialLabel"] == 1][STD_COLS]]
+        if USE_CONTRARIAN_DENIAL:
+            print("fetch news-style denial from contrarian outlets (#3)")
+            from contrarian_sources import fetch_contrarian_denial
+            contrarian = fetch_contrarian_denial(
+                max_per_source=CONTRARIAN_MAX_PER_SOURCE
+            )
+            if len(contrarian):
+                denial_frames.append(contrarian[STD_COLS])
+        denial = pd.concat(denial_frames, ignore_index=True)
+
+        # ----- assemble not-denial (negative) pool -----
+        negative_frames = [cards[cards["DenialLabel"] == 0][STD_COLS]]
         if USE_GDELT_NEGATIVES:
-            # Scrape real GDELT mainstream climate news; keep the not-denial
-            # ones as realistic negative examples.
             print("scrape GDELT climate news for realistic not-denial examples")
             gdf = read_df()
             gclimate = cretate_climate_df(gdf)
@@ -446,18 +469,27 @@ if __name__ == "__main__":
             gnews_neg = glabelled[glabelled["DenialLabel"] == 0].copy()
             gnews_neg["DenialLabel"] = 0
             gnews_neg["DenialScore"] = gnews_neg["DenialScore"].fillna(0.0)
-            gnews_neg = gnews_neg[STD_COLS]
+            # GDELT articles are their own groups for the grouped split
+            gnews_neg["claim_id"] = [
+                f"gdelt{i}" for i in range(len(gnews_neg))
+            ]
+            negative_frames.append(gnews_neg[STD_COLS])
 
-            # Balance: denial from CARDS vs a mix of CARDS-neutral + GDELT news
-            denial = cards[cards["DenialLabel"] == 1]
-            cards_neg = cards[cards["DenialLabel"] == 0][STD_COLS]
-            dataset = combine_balanced(denial[STD_COLS], [cards_neg, gnews_neg])
+        if USE_CONTRARIAN_DENIAL or USE_GDELT_NEGATIVES:
+            dataset = combine_balanced(denial, negative_frames)
         else:
             dataset = cards
 
         if USE_CACHE:
             dataset.to_pickle(DATASET_CACHE)
             print(f"[cache] saved dataset -> {DATASET_CACHE}")
+
+    # #9: export a gold slice for hand-labelling (skips if it already exists),
+    # and report agreement if you've filled it in.
+    if EXPORT_GOLD_SLICE:
+        from gold_slice import export_gold_slice, load_gold_slice
+        export_gold_slice(dataset, GOLD_SLICE_PATH, n=GOLD_SLICE_N)
+        load_gold_slice(GOLD_SLICE_PATH)
 
     embs = create_embedding(dataset, rebuild=REBUILD_EMBEDDINGS)
 
@@ -466,24 +498,26 @@ if __name__ == "__main__":
     # X is the multilingual embeddings of the (original or translated) text
     X_embeddings = np.array(data["embeddings"])
 
-    # y is the denial label (0/1); both classes share source + languages
+    # y is the denial label (0/1); claim_id groups rows for leakage-free eval
     metadatas = data["metadatas"]
     y_labels = np.array([int(meta["label"]) for meta in metadatas])
     languages = [str(meta["language"]) for meta in metadatas]
+    claim_ids = [str(meta.get("claim_id", meta["url"])) for meta in metadatas]
 
     # Stage 3: inspect the language x label distribution (should be balanced now)
     print_language_label_crosstab(languages, y_labels)
 
-    # Stage 6: overall + per-language macro-F1 evaluation
+    # Stage 6: overall + per-language macro-F1 evaluation (claim-grouped split)
     trained_model = evaluate(
         X_embeddings,
         y_labels,
         languages,
+        groups=claim_ids,
         target_names=["Not Denial", "Denial"],
     )
 
-    # Stage 6: cross-lingual transfer (train on some languages, test held-out one)
-    auto_cross_lingual(X_embeddings, y_labels, languages)
+    # Stage 6: cross-lingual transfer (grouped: shared claims excluded from train)
+    auto_cross_lingual(X_embeddings, y_labels, languages, groups=claim_ids)
 
     # Train a final model on ALL data and persist it for prediction (predict.py)
     MODEL_PATH = "./model/denial_clf.joblib"

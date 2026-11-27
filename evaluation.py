@@ -18,7 +18,12 @@ from collections import Counter
 import joblib
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import (
+    train_test_split,
+    cross_val_score,
+    GroupShuffleSplit,
+    StratifiedGroupKFold,
+)
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
 
@@ -75,6 +80,7 @@ def evaluate(
     X,
     y,
     languages,
+    groups=None,
     test_size: float = 0.2,
     random_state: int = 42,
     C: float = 10.0,
@@ -82,17 +88,30 @@ def evaluate(
 ):
     """Train LR and report overall macro-F1, confusion matrix, per-language F1.
 
-    Returns the fitted model.
+    If ``groups`` (e.g. claim_id per row) is given, the train/test split and
+    cross-validation are GROUPED so that all rows sharing a group (e.g. the
+    English claim and all its translations) stay on the same side - preventing
+    cross-translation leakage. Returns the fitted model.
     """
     X = np.asarray(X)
     y = np.asarray(y).astype(int)
     languages = np.asarray(languages)
+    grouped = groups is not None
+    if grouped:
+        groups = np.asarray(groups)
 
-    # Split on indices so we can recover per-row languages for the test set
+    # ---- held-out split (grouped if groups given) ----
     indices = np.arange(len(y))
-    i_train, i_test = train_test_split(
-        indices, test_size=test_size, random_state=random_state, stratify=y
-    )
+    if grouped:
+        gss = GroupShuffleSplit(n_splits=1, test_size=test_size,
+                                random_state=random_state)
+        i_train, i_test = next(gss.split(indices, y, groups))
+        split_note = "grouped by claim_id"
+    else:
+        i_train, i_test = train_test_split(
+            indices, test_size=test_size, random_state=random_state, stratify=y
+        )
+        split_note = "stratified"
 
     model = _make_lr(C=C, random_state=random_state)
     model.fit(X[i_train], y[i_train])
@@ -100,7 +119,7 @@ def evaluate(
     y_true = y[i_test]
     y_pred = model.predict(X[i_test])
 
-    print("\n=== Stage 6: overall evaluation ===")
+    print(f"\n=== Stage 6: overall evaluation ({split_note}) ===")
     print(classification_report(
         y_true, y_pred, target_names=list(target_names), zero_division=0
     ))
@@ -110,15 +129,24 @@ def evaluate(
     print("Confusion matrix (rows=true, cols=pred):")
     print(confusion_matrix(y_true, y_pred, labels=[0, 1]))
 
-    # Cross-validated macro-F1 for robustness; guard against tiny classes
+    # ---- cross-validated macro-F1 (grouped if groups given) ----
     min_class = min(Counter(y).values())
     n_folds = min(5, min_class)
     if n_folds >= 2:
-        cv_scores = cross_val_score(
-            _make_lr(C=C, random_state=random_state),
-            X, y, cv=n_folds, scoring="f1_macro",
-        )
-        print(f"{n_folds}-fold CV macro-F1: {cv_scores.mean():.4f} "
+        if grouped:
+            splitter = StratifiedGroupKFold(n_splits=n_folds)
+            cv_scores = cross_val_score(
+                _make_lr(C=C, random_state=random_state),
+                X, y, groups=groups, cv=splitter, scoring="f1_macro",
+            )
+            cv_note = "grouped "
+        else:
+            cv_scores = cross_val_score(
+                _make_lr(C=C, random_state=random_state),
+                X, y, cv=n_folds, scoring="f1_macro",
+            )
+            cv_note = ""
+        print(f"{n_folds}-fold {cv_note}CV macro-F1: {cv_scores.mean():.4f} "
               f"(+/- {cv_scores.std():.4f})")
     else:
         print("[warn] a class has < 2 samples; skipping cross-validation")
@@ -141,11 +169,15 @@ def evaluate(
 # Stage 6: cross-lingual transfer
 # ---------------------------------------------------------------------------
 def cross_lingual_transfer(
-    X, y, languages, train_langs, test_lang, C: float = 10.0, random_state: int = 42
+    X, y, languages, train_langs, test_lang, groups=None,
+    C: float = 10.0, random_state: int = 42
 ):
     """Train on ``train_langs`` and test on held-out ``test_lang``.
 
-    Returns the transfer macro-F1, or None if the experiment is not runnable.
+    If ``groups`` (claim_id) is given, any training row whose claim appears in
+    the test language is EXCLUDED, so the test measures transfer to genuinely
+    unseen claims (not claims already seen in another language). Returns the
+    transfer macro-F1, or None if not runnable.
     """
     X = np.asarray(X)
     y = np.asarray(y).astype(int)
@@ -153,6 +185,15 @@ def cross_lingual_transfer(
 
     train_mask = np.isin(languages, list(train_langs))
     test_mask = languages == test_lang
+
+    note = ""
+    if groups is not None:
+        groups = np.asarray(groups)
+        test_groups = set(groups[test_mask].tolist())
+        shared = np.isin(groups, list(test_groups))
+        # exclude training rows that share a claim with the test language
+        train_mask = train_mask & ~shared
+        note = " (claims shared with test language excluded from train)"
 
     if train_mask.sum() == 0 or test_mask.sum() == 0:
         print(f"[transfer] skip: train={int(train_mask.sum())} "
@@ -168,7 +209,7 @@ def cross_lingual_transfer(
     macro = f1_score(y[test_mask], y_pred, average="macro",
                      labels=[0, 1], zero_division=0)
 
-    print("\n=== Stage 6: cross-lingual transfer ===")
+    print(f"\n=== Stage 6: cross-lingual transfer{note} ===")
     print(f"train on {sorted(str(l) for l in train_langs)} "
           f"(n={int(train_mask.sum())}) "
           f"-> test on '{test_lang}' (n={int(test_mask.sum())})")
@@ -178,11 +219,12 @@ def cross_lingual_transfer(
     return macro
 
 
-def auto_cross_lingual(X, y, languages, min_rows: int = 10):
+def auto_cross_lingual(X, y, languages, groups=None, min_rows: int = 10):
     """Automatically pick a held-out non-English language and run transfer.
 
     Chooses the non-English language that has both classes and the most rows,
-    trains on all other languages, and tests on it.
+    trains on all other languages, and tests on it. Passes ``groups`` through
+    so shared claims are excluded from training.
     """
     y = np.asarray(y).astype(int)
     languages = np.asarray(languages)
@@ -202,7 +244,8 @@ def auto_cross_lingual(X, y, languages, min_rows: int = 10):
 
     held_out = str(max(candidates, key=lambda t: t[1])[0])
     train_langs = [str(l) for l in set(languages) if str(l) != held_out]
-    return cross_lingual_transfer(X, y, languages, train_langs, held_out)
+    return cross_lingual_transfer(X, y, languages, train_langs, held_out,
+                                  groups=groups)
 
 
 # ---------------------------------------------------------------------------

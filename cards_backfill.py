@@ -59,15 +59,25 @@ def download_cards_data(cache_dir: str = CACHE_DIR) -> str:
     return training_csv
 
 
-def _rows_to_df(texts, language: str, label: int, source: str) -> pd.DataFrame:
-    """Build a pipeline-compatible dataframe for one (language, label) group."""
+def _rows_to_df(texts, language: str, label: int, source: str,
+                claim_ids=None) -> pd.DataFrame:
+    """Build a pipeline-compatible dataframe for one (language, label) group.
+
+    claim_ids: optional list (aligned with texts) identifying the ORIGINAL claim
+    each row derives from. Translations of the same English claim share a
+    claim_id so a grouped train/test split can keep them on the same side.
+    If omitted, each row gets a unique claim_id.
+    """
     n = len(texts)
+    if claim_ids is None:
+        claim_ids = [f"{source}/{language}/{label}/{i}" for i in range(n)]
     return pd.DataFrame(
         {
             "FullText": [str(t) for t in texts],
             "Language": language,
             "DenialLabel": int(label),
             "DenialScore": float(label),
+            "claim_id": [str(c) for c in claim_ids],
             # Columns the embedding step expects:
             "SourceCommonName": source,
             "DocumentIdentifier": [
@@ -144,9 +154,12 @@ def build_cards_dataset(
         cache_dir=cache_dir, denial=False,
         max_examples=per_class_english, random_state=random_state,
     )
+    # claim_id namespaces: 'd{i}' for denial, 'n{i}' for not-denial.
+    denial_ids = [f"d{i}" for i in range(len(denial_en))]
+    notden_ids = [f"n{i}" for i in range(len(notden_en))]
     frames = [
-        _rows_to_df(denial_en, "eng", 1, "CARDS"),
-        _rows_to_df(notden_en, "eng", 0, "CARDS"),
+        _rows_to_df(denial_en, "eng", 1, "CARDS", claim_ids=denial_ids),
+        _rows_to_df(notden_en, "eng", 0, "CARDS", claim_ids=notden_ids),
     ]
 
     if translate_backfill and target_languages:
@@ -155,6 +168,9 @@ def build_cards_dataset(
 
         denial_pool = denial_en[:per_class_translated]
         notden_pool = notden_en[:per_class_translated]
+        # translations reuse the SAME claim_id as the English source claim
+        denial_pool_ids = denial_ids[:per_class_translated]
+        notden_pool_ids = notden_ids[:per_class_translated]
         for lang in target_languages:
             if lang == "eng":
                 continue
@@ -166,10 +182,12 @@ def build_cards_dataset(
                   f"{len(notden_pool)} not-denial -> '{lang}' ({tgt_code})")
             if denial_pool:
                 den_tr = nllb_translate(denial_pool, TARGET_LANG, tgt_code)
-                frames.append(_rows_to_df(den_tr, lang, 1, "CARDS-translated"))
+                frames.append(_rows_to_df(den_tr, lang, 1, "CARDS-translated",
+                                          claim_ids=denial_pool_ids))
             if notden_pool:
                 not_tr = nllb_translate(notden_pool, TARGET_LANG, tgt_code)
-                frames.append(_rows_to_df(not_tr, lang, 0, "CARDS-translated"))
+                frames.append(_rows_to_df(not_tr, lang, 0, "CARDS-translated",
+                                          claim_ids=notden_pool_ids))
 
     result = pd.concat(frames, ignore_index=True).reset_index(drop=True)
     n_den = int((result["DenialLabel"] == 1).sum())
@@ -195,14 +213,16 @@ def combine_balanced(positive_df, negative_dfs, random_state: int = 42):
         Balanced, shuffled dataframe.
     """
     negatives = pd.concat(list(negative_dfs), ignore_index=True)
-    n_pos = len(positive_df)
-    if len(negatives) > n_pos:
-        negatives = negatives.sample(n_pos, random_state=random_state)
-    combined = pd.concat([positive_df, negatives], ignore_index=True)
+    n = min(len(positive_df), len(negatives))
+    pos = (positive_df.sample(n, random_state=random_state)
+           if len(positive_df) > n else positive_df)
+    neg = (negatives.sample(n, random_state=random_state)
+           if len(negatives) > n else negatives)
+    combined = pd.concat([pos, neg], ignore_index=True)
     # shuffle so classes/sources are interleaved
     combined = combined.sample(frac=1, random_state=random_state).reset_index(drop=True)
     n_den = int((combined["DenialLabel"] == 1).sum())
     print(f"[combine] balanced set: {len(combined)} rows "
           f"({n_den} denial / {len(combined) - n_den} not-denial); "
-          f"negatives from {negatives['SourceCommonName'].nunique()} source name(s)")
+          f"negatives from {neg['SourceCommonName'].nunique()} source name(s)")
     return combined
